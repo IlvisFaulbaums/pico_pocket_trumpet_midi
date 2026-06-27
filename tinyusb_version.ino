@@ -6,38 +6,41 @@ Adafruit_USBD_MIDI usb_midi;
 MIDI_CREATE_INSTANCE(Adafruit_USBD_MIDI, usb_midi, MIDI);
 
 int  in[128];
-// Sliekšņi notīm oktāvas ietvaros (0-255)
 byte NoteV[13] = {8, 23, 40, 57, 76, 96, 116, 138, 162, 187, 213, 241, 255};
 float f_peaks[5];
 int Mic_pin;
 
-const int POGA_1 = 2; // Ventiļs 1
-const int POGA_2 = 3; // Ventiļs 2
-const int POGA_3 = 4; // Ventiļs 3
+const int POGA_1 = 2;
+const int POGA_2 = 3;
+const int POGA_3 = 4;
 
 bool stavoklis1 = false, stavoklis2 = false, stavoklis3 = false;
 bool ieprieks1 = false, ieprieks2 = false, ieprieks3 = false;
 
-// Rakstītās trompetes harmonikas (MIDI numuri)
-// Katrai kombinācijai definējam pilnu sēriju (Partial 2, 3, 4, 5, 6, 8)
-// 000 - Open, 001 - 3, 010 - 2, 011 - 2+3, 100 - 1, 101 - 1+3, 110 - 1+2, 111 - 1+2+3
+// Harmoniku tabula (nemainīga)
 const byte harmonikas[8][7] = {
-  {48, 60, 67, 72, 76, 79, 84}, // 000: C3 (pedal), C4, G4, C5, E5, G5, C6
-  {45, 57, 64, 69, 73, 76, 81}, // 001: (V3) A3, A4, E5...
-  {47, 59, 66, 71, 75, 78, 83}, // 010: (V2) B3, B4, F#5...
-  {44, 56, 63, 68, 72, 75, 80}, // 011: (V2+3) Ab3, Ab4, Eb5...
-  {46, 58, 65, 70, 74, 77, 82}, // 100: (V1) Bb3, Bb4, F5...
-  {43, 55, 62, 67, 71, 74, 79}, // 101: (V1+3) G3, G4, D5...
-  {45, 57, 64, 69, 73, 76, 81}, // 110: (V1+2) A3, A4, E5...
-  {42, 54, 61, 66, 70, 73, 78}  // 111: (V1+2+3) F#3, F#4, C#5...
+  {48, 60, 67, 72, 76, 79, 84},
+  {45, 57, 64, 69, 73, 76, 81},
+  {47, 59, 66, 71, 75, 78, 83},
+  {44, 56, 63, 68, 72, 75, 80},
+  {46, 58, 65, 70, 74, 77, 82},
+  {43, 55, 62, 67, 71, 74, 79},
+  {45, 57, 64, 69, 73, 76, 81},
+  {42, 54, 61, 66, 70, 73, 78}
 };
 
-int lastMidiNote = -1; 
+int lastMidiNote = -1;
+
+// Dinamiskās filtrēšanas mainīgie
+const float AMPLITUDE_THRESHOLD = 5.0; // zemāks slieksnis vājākām notīm
+
+int candidateNote = -1;
+int confirmCounter = 0;
 
 void printNoteName(byte midiNote) {
   const char* names[] = {"C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"};
   Serial.print(names[midiNote % 12]);
-  Serial.print(midiNote / 12 - 1); // Oktāva
+  Serial.print(midiNote / 12 - 1);
 }
 
 void setup() {
@@ -59,13 +62,15 @@ void loop() {
   stavoklis2 = (digitalRead(POGA_2) == LOW);
   stavoklis3 = (digitalRead(POGA_3) == LOW);
 
-  // Ja mainās ventiļi, pārtraucam iepriekšējo noti
+  // Ventiļu maiņa – tūlīt izslēdzam noti un attīrām kandidātu
   if (stavoklis1 != ieprieks1 || stavoklis2 != ieprieks2 || stavoklis3 != ieprieks3) {
     if (lastMidiNote >= 0) {
       MIDI.sendNoteOff(lastMidiNote, 0, 1);
       lastMidiNote = -1;
     }
     ieprieks1 = stavoklis1; ieprieks2 = stavoklis2; ieprieks3 = stavoklis3;
+    candidateNote = -1;
+    confirmCounter = 0;
   }
 
   Tone_det();
@@ -89,26 +94,20 @@ void Tone_det() {
   sum2 = sqrt(sum2 / 128);
   sampling = 128000000.0 / (b - a1);
 
-  if (sum2 - sum1 > 5.0) { // Ja ir skaņa
+  // Skaņas klātbūtne
+  if (sum2 - sum1 > AMPLITUDE_THRESHOLD) {
     FFT(128, sampling);
 
-    // Mēs meklēsim spēcīgāko pīķi un noteiksim tā absolūto MIDI noti
-    float max_peak_freq = f_peaks[0]; 
-    if (max_peak_freq < 60) return; // Pārāk zems
+    float max_peak_freq = f_peaks[0];
+    if (max_peak_freq < 60) return;
 
-    // Aprēķinām MIDI noti no frekvences: 12 * log2(f/440) + 69
     int detektetaNote = round(12.0 * log2(max_peak_freq / 440.0) + 69.0);
-    
-    // Pārejam uz "rakstīto" noti (trompete Bb: rakstītā ir par 2 pustoņiem augstāka)
     int rakstitaNotis = detektetaNote + 2;
 
-    // Noskaidrojam ventiļu kombināciju
     byte comb = (stavoklis1 ? 4 : 0) | (stavoklis2 ? 2 : 0) | (stavoklis3 ? 1 : 0);
-    
+
     int labakaNotis = -1;
     int mazakaStarpiba = 99;
-
-    // Atrodam tuvāko harmoniku no sērijas
     for (int n = 0; n < 7; n++) {
       int h = harmonikas[comb][n];
       int diff = abs(rakstitaNotis - h);
@@ -118,26 +117,62 @@ void Tone_det() {
       }
     }
 
-    // Ja starpība ir saprātīga (piem. 2 pustoņi), spēlējam
     if (labakaNotis >= 0 && mazakaStarpiba <= 2) {
-      int concertMidi = labakaNotis - 2; // Koncertskaņa MIDI izvadei
+      int concertMidi = labakaNotis - 2;
 
-      if (concertMidi != lastMidiNote) {
-        if (lastMidiNote >= 0) MIDI.sendNoteOff(lastMidiNote, 0, 1);
-        
-        MIDI.sendNoteOn(concertMidi, 127, 1);
-        Serial.print("Rakstītā: "); printNoteName(labakaNotis);
-        Serial.print(" -> MIDI: "); Serial.println(concertMidi);
-        lastMidiNote = concertMidi;
+      // Ja šī pati nots jau skan, neko nedarām
+      if (concertMidi == lastMidiNote) {
+        candidateNote = -1;
+        confirmCounter = 0;
+        return;
       }
+
+      // ------------------- DINAMISKAIS APSTIPRINĀJUMS -------------------
+      // Nosakām, cik reižu jāapstiprina:
+      // - mazs intervāls (≤6 pustoņi) -> 1 reize (tūlītēja)
+      // - liels intervāls (≥7 pustoņi) -> 3 reizes (novērš oktāvu lēcienus)
+      int requiredConfirms = 1;
+      if (lastMidiNote != -1) {
+        int interval = abs(concertMidi - lastMidiNote);
+        if (interval >= 7) {
+          requiredConfirms = 3;
+        }
+      }
+
+      if (concertMidi == candidateNote) {
+        confirmCounter++;
+        if (confirmCounter >= requiredConfirms) {
+          // Apstiprināta jauna nots – ieslēdzam
+          if (lastMidiNote >= 0) MIDI.sendNoteOff(lastMidiNote, 0, 1);
+          MIDI.sendNoteOn(concertMidi, 127, 1);
+          Serial.print("Rakstītā: "); printNoteName(labakaNotis);
+          Serial.print(" -> MIDI: "); Serial.println(concertMidi);
+          lastMidiNote = concertMidi;
+          candidateNote = -1;
+          confirmCounter = 0;
+        }
+      } else {
+        // Jauna kandidāta noteikšana
+        candidateNote = concertMidi;
+        confirmCounter = 1;
+      }
+      // ------------------------------------------------------------------
+    } else {
+      // Neatbilst harmonikai – nullejam kandidātu
+      candidateNote = -1;
+      confirmCounter = 0;
     }
-  } else if (lastMidiNote >= 0) {
-    MIDI.sendNoteOff(lastMidiNote, 0, 1);
-    lastMidiNote = -1;
+  } else {
+    // Skaņas nav – izslēdzam noti un attīrām kandidātu
+    if (lastMidiNote >= 0) {
+      MIDI.sendNoteOff(lastMidiNote, 0, 1);
+      lastMidiNote = -1;
+    }
+    candidateNote = -1;
+    confirmCounter = 0;
   }
 }
 
-// FFT funkcija paliek nemainīta, bet pārliecinies, ka f_peaks[0] ir galvenā frekvence
 // ======================= FFT (nemainīta) ====================================
 float FFT(byte N, float Frequency) {
   byte data[8] = {1, 2, 4, 8, 16, 32, 64, 128};
